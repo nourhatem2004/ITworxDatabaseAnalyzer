@@ -8,15 +8,14 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 import numpy as np
 import uuid
 import warnings
+import gradio as gr
 warnings.filterwarnings("ignore")
 
 load_dotenv() 
+
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY")) 
 qdrant = QdrantClient(":memory:")
-
 llm = genai.GenerativeModel("gemini-2.5-flash-lite-preview-06-17")
-
-
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 def get_embedding(text: str):
@@ -31,6 +30,8 @@ def connect_db():
         'Trusted_Connection=yes;'    
     )
     return conn
+
+conn = connect_db()
 
 def get_schema_info(conn):
     """Extract schema info (tables, columns, datatypes)."""
@@ -79,11 +80,11 @@ def insert_schema_to_qdrant(schema_rows):
 
 def extract_words(question):
     prompt = f"""
-You are an AI agent that extracts the 5 most relevant keywords from a user question for use in a RAG system.
+You are an AI agent that extracts the 5 most relevant keywords from a user question in relevance to the chat history for use in a RAG system.
 
 user question: {question}
 
-Example: 
+Example (no history): 
 User question: "Who are our highest earners in the company?" 
 Output: ["salary", "earnings", "name", "HR", "employee"]
 
@@ -101,7 +102,7 @@ Rules:
     return keywords
 
 
-def generate_sql_from_question(keywords):
+def generate_sql_from_question(keywords,question):
     
     schema_context=''
     example_context=''
@@ -176,22 +177,23 @@ def retrieve_from_db(query, conn):
     return s
 
 
-if __name__ == "__main__":
-    
-    conn = connect_db()
+def chat_func(message,history):
     schema = get_schema_info(conn)
     insert_schema_to_qdrant(schema)
-
-
-    question = "who are our highest earners and what are their slaries?"
-
+    question = message
     keywords = extract_words(question)
-
-    sql = generate_sql_from_question(keywords)
-    
+    sql = generate_sql_from_question(keywords,question)
     query, thought_process = split_sql(sql)
     data = retrieve_from_db(query,conn)
     response = chat_prompt(data,thought_process,question)
 
-    print(response)
 
+    return response
+
+
+
+if __name__ == "__main__":
+    gr.ChatInterface(
+    fn=chat_func, 
+    type="messages"
+    ).launch()
