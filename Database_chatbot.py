@@ -21,7 +21,7 @@ load_dotenv()
 llm = LLM(
     model="gemini-2.5-flash",
     api_key=os.environ["GOOGLE_API_KEY"],
-    temperature=0.7
+    temperature=0
 )
 
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY")) 
@@ -370,6 +370,9 @@ def sql_tool(sql_query: str):
 
 
 
+
+
+
 # -----------------------------------------
 # CrewAI: AGENTS
 # -----------------------------------------
@@ -390,6 +393,19 @@ coordinator_agent = Agent(
     4. If user requests structure or explanation → route to Response Agent.
     """,
     tools=[context_extractor],
+    llm=llm
+)
+
+schema_linking_agent = Agent(
+    name="Schema Linking Agent",
+    backstory=(
+        "You are a database schema expert. You analyze user questions and identify "
+        "exactly which tables, columns, foreign keys, and constraints are relevant. "
+        "You output structured decisions, not raw data."
+    ),
+    role="Identify relevant schema elements",
+    goal="Analyze the user question and output a structured list of schema elements to retrieve",
+    tools=[],
     llm=llm
 )
 
@@ -456,14 +472,21 @@ response_agent = Agent(
 
 check_task = Task(
     description="""
-        You are given two inputs:
+        You are given four inputs:
         1. A database summary:
         {db_summary}
 
         2. A user prompt:
         {user_prompt}
 
-        Your job is to return TWO decisions:
+        3. Chat history:
+        {chat_history}
+
+        4. Previously collected data and performed queries:
+        {total_context}
+
+
+        Your job is to return THREE decisions:
 
         ------------------------------------------
         1. is_true:
@@ -473,13 +496,33 @@ check_task = Task(
 
         2. is_queryable:
             • TRUE → The user is asking about something that can be answered 
-              by retrieving or inferring *actual data* (e.g. rows, values, counts).
+              by retrieving or inferring *actual data* (e.g. rows, values, counts) OR The user asks about a how a query should be written or even mentions a query.
             • FALSE → The user is only asking conceptual metadata (e.g. 
-              "list tables", "what is the relation", "what columns exist").
-
-        3. is_followUp:
-            • TRUE → The user is asking a follow up question on the previous prompt and not asking an entirly new question.
-            • FALSE → The user is following up on the previous prompt.      
+              "list tables", "what is the relation", "what columns exist") THAT IS NOT A QUERY.
+        
+        3. needs_rag:
+            • TRUE → Need to extract new database context using RAG/embeddings because:
+              - This is a NEW question (not a follow-up)
+              - OR it's a follow-up but asks about DIFFERENT tables/entities than before
+              - OR it's a follow-up that needs ADDITIONAL context not in total_context
+              - The data in "Previously collected data and performed queries" is not sufficient enough to answer the user query
+            • FALSE → Can answer using existing context because:
+              - This is a simple follow-up asking for clarification/rephrasing
+              - OR asking to modify/filter the previous query result
+              - OR the "Previously collected data and performed queries" already contains all necessary schema information
+              - OR simple conversational responses like "thank you"
+            
+            Examples:
+            - "What tables exist?" → TRUE (new question, need context)
+            - "Show me all customers" → TRUE (new question, need Customer table context)
+            - "Now show me their orders" → TRUE (follow-up but NEW entity: orders)
+            - "Sort that by date" → FALSE (follow-up on same data)
+            - "What does that mean?" → FALSE (clarification request)
+            - "Add a WHERE clause for status='active'" → FALSE (modifying existing query)
+            - "How are Orders and Customers related?" → TRUE (need relationship context)
+            - "Now also include Products" → TRUE (adding new entity, need more context)
+            - "Explain the previous result" → FALSE (working with existing data)
+            - "Can you make that query faster?" → FALSE (optimization of existing query)
 
         ------------------------------------------
 
@@ -487,308 +530,859 @@ check_task = Task(
 
         {{
           "is_true": "TRUE" or "FALSE",
-          "is_queryable": "TRUE" or "FALSE"
-          "is_followUp": "TRUE" or "FALSE"
+          "is_queryable": "TRUE" or "FALSE",
+          "needs_rag": "TRUE" or "FALSE"
         }}
     """,
     agent=coordinator_agent,
-    expected_output="A JSON object with fields: { 'is_true': 'TRUE' or 'FALSE', 'is_queryable': 'TRUE' or 'FALSE' }"
+    expected_output="A JSON object with fields: { 'is_true': 'TRUE' or 'FALSE', 'is_queryable': 'TRUE' or 'FALSE', 'needs_rag': 'TRUE' or 'FALSE' }"
 )
 
 
-extractor_task = Task(
+schema_linking_task = Task(
     description="""
-        You are an intelligent database context extractor.
-        Your mission: Analyze the user's question and strategically query the right metadata collections 
-        to build a comprehensive context for answering their question.
-
-        USER PROMPT:
+        You are a Schema Linking specialist.
+        
+        PREVIOUS CHECK RESULT:
+        {check_task.output}
+        
+        === STEP 1: CHECK IF YOU SHOULD SKIP ===
+        1. Parse the check_task.output JSON
+        2. Look for the "needs_rag" field
+        3. Look for the "is_true" field
+        4. If EITHER needs_rag is "FALSE" OR is_true is "FALSE":
+           - Output EXACTLY: {{"skip": true}}
+           - STOP here, do NOT continue
+        
+        USER QUESTION:
         {user_prompt}
-
-        AVAILABLE METADATA COLLECTIONS:
-        - tables: Table metadata (schema, name, type, row counts, column names)
-        - columns: Column details (data types, constraints, nullability, defaults)
-        - primary_keys: Primary key definitions for all tables
-        - foreign_keys: Foreign key relationships (parent/child table connections)
-        - indexes: Index definitions (columns indexed, uniqueness, performance optimization)
-        - constraints: All constraints (PK, FK, UNIQUE, CHECK)
-        - check_constraints: Business rules and validation logic
-        - triggers: Automated actions on data changes
-        - views: Virtual table definitions
-        - routines: Stored procedures and functions
-
-        === YOUR EXTRACTION STRATEGY ===
-
-        STEP 1: ANALYZE THE QUERY TYPE
-        Identify what the user is asking about:
-        - Schema exploration? → "what tables exist", "show me the database structure"
-        - Relationships? → "how are X and Y connected", "what's the relationship between"
-        - Data retrieval? → "get all", "show me", "find", "count", "sum"
-        - Constraints? → "what are the rules", "validation", "requirements"
-        - Performance? → "indexes", "optimization", "slow queries"
-
-        STEP 2: EXTRACT KEY ENTITIES
-        From the user prompt, identify:
-        - Table names (even partial matches like "user" → "Users", "UserProfile")
-        - Column names (like "price", "email", "date")
-        - Concepts (like "sales", "inventory", "employee")
-        - Actions (like "sold", "purchased", "hired")
-
-        STEP 3: BUILD SEARCH PROMPTS
-        Create semantic search prompts that capture the essence:
-        - Use multiple related terms: "product item goods merchandise"
-        - Include variations: "employee worker staff person"
-        - Think domain-specific: "order purchase sale transaction"
-
-        STEP 4: QUERY MULTIPLE COLLECTIONS
-        Call context_extractor tool strategically with appropriate k values:
-        - k=3-5 for specific entities (targeted search)
-        - k=8-15 for exploratory queries (broad search)
-        - k=10-20 for complex multi-table questions
-
-        === DETAILED EXAMPLES ===
-
-        Example 1: Relationship Query
+        
+        DATABASE SUMMARY:
+        {db_summary}
+        
+        PREVIOUS CONTEXT (if follow-up question):
+        {total_context}
+        
+        === AVAILABLE METADATA COLLECTIONS ===
+        
+        **Core Structure Collections:**
+        - **tables**: Metadata about each table (schema, name, type, engine, row stats)
+        - **columns**: Column metadata (data types, length, nullability, defaults, extra details)
+        - **primary_keys**: Primary key columns for every table
+        - **foreign_keys**: Relationships between tables (parent/child columns)
+        
+        **Optimization & Performance:**
+        - **indexes**: All indexes including type, uniqueness, and indexed columns
+        
+        **Business Rules & Validation:**
+        - **constraints**: All constraints (PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK)
+        - **check_constraints**: Check constraints and validation rules at table level
+        
+        **Advanced Database Objects:**
+        - **triggers**: Trigger metadata and SQL definitions
+        - **views**: View definitions and metadata for all SQL views
+        - **routines**: Stored procedures and functions (definitions, return types)
+        
+        === WHEN TO USE EACH COLLECTION ===
+        
+        **Always Query:**
+        - tables: For ANY query (foundation of schema understanding)
+        - columns: For ANY query involving data retrieval or structure
+        
+        **Query for Relationships:**
+        - foreign_keys: Multi-table queries, joins, "how are X and Y related"
+        - primary_keys: Understanding table identity and relationships
+        
+        **Query for Performance Questions:**
+        - indexes: "Which indexes exist?", "How is X indexed?", "Performance optimization"
+        
+        **Query for Business Rules:**
+        - constraints: "What are the rules?", "What constraints exist?"
+        - check_constraints: "Validation rules", "What values are allowed?"
+        
+        **Query for Advanced Features:**
+        - triggers: "What triggers exist?", "Automated actions", "What happens when X changes?"
+        - views: "What views exist?", "Show me virtual tables", "Summary tables"
+        - routines: "What stored procedures?", "What functions?", "Database logic"
+        
+        === STEP 2: ANALYZE THE QUESTION ===
+        
+        Break down the user question to identify:
+        - What tables/entities are mentioned or implied?
+        - What type of data are they looking for?
+        - Do they need to join multiple tables?
+        - Are there any constraints or validation rules involved?
+        - Are they asking about performance, triggers, views, or stored procedures?
+        
+        === STEP 3: CREATE YOUR RETRIEVAL PLAN ===
+        
+        Output a JSON with these fields:
+        
+        1. **table_keywords**: List of keyword phrases to search for tables
+           - Combine related terms with spaces: "customer client buyer"
+           - Think synonyms and variations
+           - Example: ["customer client buyer", "order purchase sale", "product item goods"]
+        
+        2. **column_keywords**: List of keyword phrases to search for columns
+           - Combine related column concepts with spaces
+           - Think about what data fields would be needed
+           - Example: ["customerID customer_id client_id", "price amount cost total", "quantity count number"]
+        
+        3. **needs_relationships**: true/false
+           - true if question involves multiple tables or asks about connections
+           - true if question asks "how", "relationship", "connected"
+        
+        4. **relationship_keywords**: List of keyword phrases for FK searches (only if needs_relationships is true)
+           - Combine table names that need to be connected
+           - Example: ["customer order", "order product", "customer address"]
+        
+        5. **needs_constraints**: true/false
+           - true if asking about rules, validation, requirements, constraints
+        
+        6. **needs_indexes**: true/false
+           - true if asking about performance, optimization, or indexes
+        
+        7. **needs_triggers**: true/false
+           - true if asking about triggers, automated actions, or "what happens when"
+        
+        8. **needs_views**: true/false
+           - true if asking about views, virtual tables, or summary tables
+        
+        9. **needs_routines**: true/false
+           - true if asking about stored procedures, functions, or database logic
+        
+        10. **advanced_keywords**: List of keyword phrases for triggers/views/routines (only if any of needs_triggers/views/routines is true)
+            - Example: ["customer order", "sales report", "calculate total"]
+        
+        11. **search_breadth**: Choose ONE:
+            - "narrow": Simple single-table query → k_tables=15, k_columns=25, k_fk=30
+            - "medium": 2-3 tables, moderate complexity → k_tables=35, k_columns=50, k_fk=60
+            - "wide": Complex multi-table or exploratory → k_tables=60, k_columns=80, k_fk=100
+        
+        === EXAMPLES ===
+        
+        Example 1: Simple Query
+        User: "Show me all customers"
+        
+        Analysis:
+        - Single table (customers)
+        - No joins needed
+        - Need customer-related columns
+        
+        Output:
+        {{
+          "table_keywords": ["customer client buyer user"],
+          "column_keywords": [
+            "customerID customer_id client_id",
+            "name first_name last_name full_name",
+            "email email_address contact",
+            "phone telephone mobile"
+          ],
+          "needs_relationships": false,
+          "relationship_keywords": [],
+          "needs_constraints": false,
+          "needs_indexes": false,
+          "needs_triggers": false,
+          "needs_views": false,
+          "needs_routines": false,
+          "advanced_keywords": [],
+          "search_breadth": "narrow"
+        }}
+        
+        Example 2: Relationship Query
         User: "What is the relationship between Orders and Customers?"
-        Analysis: Need to understand table structure and how they connect
-        Actions:
-          → tool_call(prompt="orders customers", collection_name="tables", k=5)
-          → tool_call(prompt="orders customers", collection_name="foreign_keys", k=8)
-          → tool_call(prompt="orders customers", collection_name="primary_keys", k=6)
-          → tool_call(prompt="orders customers relationship", collection_name="columns", k=10)
-
-        Example 2: Data Retrieval Query
-        User: "Show me the most sold products"
-        Analysis: Need product tables, sales data, possibly order details
-        Actions:
-          → tool_call(prompt="product item goods", collection_name="tables", k=8)
-          → tool_call(prompt="sales order quantity sold", collection_name="tables", k=8)
-          → tool_call(prompt="product order sale", collection_name="foreign_keys", k=10)
-          → tool_call(prompt="productID itemID", collection_name="columns", k=12)
-          → tool_call(prompt="quantity amount sold price", collection_name="columns", k=10)
-
-        Example 3: Schema Exploration
-        User: "What tables are related to employees?"
-        Analysis: Find all employee-related tables and their connections
-        Actions:
-          → tool_call(prompt="employee worker staff person hr", collection_name="tables", k=15)
-          → tool_call(prompt="employee", collection_name="foreign_keys", k=12)
-          → tool_call(prompt="employeeID staffID workerID", collection_name="columns", k=10)
-
+        
+        Analysis:
+        - Two tables: orders, customers
+        - Explicitly asking about relationships
+        - Need foreign keys
+        
+        Output:
+        {{
+          "table_keywords": ["order orders purchase sale", "customer client buyer"],
+          "column_keywords": [
+            "orderID order_id purchase_id",
+            "customerID customer_id client_id"
+          ],
+          "needs_relationships": true,
+          "relationship_keywords": ["customer order", "order customer"],
+          "needs_constraints": false,
+          "needs_indexes": false,
+          "needs_triggers": false,
+          "needs_views": false,
+          "needs_routines": false,
+          "advanced_keywords": [],
+          "search_breadth": "medium"
+        }}
+        
+        Example 3: Complex Aggregation
+        User: "Calculate total revenue by customer from completed orders"
+        
+        Analysis:
+        - Multiple tables: customers, orders, possibly order_items
+        - Need financial columns, status columns
+        - Need relationships between tables
+        - Aggregation means we need comprehensive context
+        
+        Output:
+        {{
+          "table_keywords": [
+            "customer client buyer user",
+            "order orders purchase sale transaction",
+            "order_detail order_item line_item",
+            "product item goods"
+          ],
+          "column_keywords": [
+            "customerID customer_id client_id user_id",
+            "orderID order_id purchase_id sale_id",
+            "revenue total_amount price cost subtotal",
+            "quantity amount count number",
+            "status order_status state completed",
+            "productID product_id item_id"
+          ],
+          "needs_relationships": true,
+          "relationship_keywords": [
+            "customer order",
+            "order order_detail order_item",
+            "order_detail product item"
+          ],
+          "needs_constraints": false,
+          "needs_indexes": false,
+          "needs_triggers": false,
+          "needs_views": false,
+          "needs_routines": false,
+          "advanced_keywords": [],
+          "search_breadth": "wide"
+        }}
+        
         Example 4: Constraint Query
         User: "What are the validation rules for the User table?"
-        Analysis: Need constraints, check constraints, and column rules
-        Actions:
-          → tool_call(prompt="user", collection_name="tables", k=3)
-          → tool_call(prompt="user", collection_name="constraints", k=10)
-          → tool_call(prompt="user", collection_name="check_constraints", k=8)
-          → tool_call(prompt="user validation", collection_name="columns", k=12)
-
-        Example 5: Multi-Table Complex Query
-        User: "How do I track a customer's purchase history including shipping?"
-        Analysis: Need customers, orders, order details, shipping/address tables
-        Actions:
-          → tool_call(prompt="customer client buyer", collection_name="tables", k=10)
-          → tool_call(prompt="order purchase transaction", collection_name="tables", k=10)
-          → tool_call(prompt="shipping delivery address", collection_name="tables", k=8)
-          → tool_call(prompt="customer order shipping", collection_name="foreign_keys", k=15)
-          → tool_call(prompt="customerID orderID", collection_name="primary_keys", k=8)
-
-        Example 6: Performance Query
+        
+        Analysis:
+        - Single table focus (users)
+        - Explicitly asking about validation/constraints
+        - Need constraint information
+        
+        Output:
+        {{
+          "table_keywords": ["user users account member"],
+          "column_keywords": [
+            "userID user_id account_id",
+            "username login user_name",
+            "email email_address",
+            "password pwd hash"
+          ],
+          "needs_relationships": false,
+          "relationship_keywords": [],
+          "needs_constraints": true,
+          "needs_indexes": false,
+          "needs_triggers": false,
+          "needs_views": false,
+          "needs_routines": false,
+          "advanced_keywords": [],
+          "search_breadth": "medium"
+        }}
+        
+        Example 5: Performance Query
         User: "Which indexes exist on the Product table?"
-        Analysis: Need table info and all related indexes
-        Actions:
-          → tool_call(prompt="product", collection_name="tables", k=3)
-          → tool_call(prompt="product", collection_name="indexes", k=10)
-          → tool_call(prompt="product", collection_name="columns", k=8)
-
-        Example 7: Aggregation Query
-        User: "Calculate total revenue by customer"
-        Analysis: Need customer, order, and financial/amount columns
-        Actions:
-          → tool_call(prompt="customer client", collection_name="tables", k=6)
-          → tool_call(prompt="order sale transaction", collection_name="tables", k=8)
-          → tool_call(prompt="revenue price amount total cost", collection_name="columns", k=15)
-          → tool_call(prompt="customer order", collection_name="foreign_keys", k=10)
-
-        Example 8: Existence Check
-        User: "Do we have supplier information?"
-        Analysis: Search for supplier-related tables broadly
-        Actions:
-          → tool_call(prompt="supplier vendor provider manufacturer distributor", collection_name="tables", k=12)
-          → tool_call(prompt="supplier vendor", collection_name="columns", k=10)
-
-        === CRITICAL RULES ===
-
-        1. ALWAYS call the tool multiple times - single calls rarely give complete context
-        2. Be CREATIVE with search terms - think synonyms and related concepts
-        3. Adjust k based on specificity:
-           - Specific entity (known table name): k=3-5
-           - General concept: k=10-15
-           - Exploratory/complex: k=15-20
-        4. For data queries, ALWAYS include:
-           - Relevant table searches
-           - Foreign key relationships
-           - Column searches for data fields
-        5. Think about the FULL data path:
-           - What tables store the data?
-           - How are they connected?
-           - What columns contain the values?
-        6. Output ALL retrieved context in your final answer
-
-        Previous check result: {check_task.output}
+        
+        Analysis:
+        - Asking about indexes specifically
+        - Need product table info and indexes
+        
+        Output:
+        {{
+          "table_keywords": ["product item goods merchandise"],
+          "column_keywords": ["productID product_id item_id"],
+          "needs_relationships": false,
+          "relationship_keywords": [],
+          "needs_constraints": false,
+          "needs_indexes": true,
+          "needs_triggers": false,
+          "needs_views": false,
+          "needs_routines": false,
+          "advanced_keywords": ["product item"],
+          "search_breadth": "narrow"
+        }}
+        
+        Example 6: Triggers Query
+        User: "What happens when an order is created?"
+        
+        Analysis:
+        - Asking about automated actions
+        - Need triggers related to orders
+        - Might also need views or routines
+        
+        Output:
+        {{
+          "table_keywords": ["order orders purchase sale"],
+          "column_keywords": ["orderID order_id status"],
+          "needs_relationships": false,
+          "relationship_keywords": [],
+          "needs_constraints": false,
+          "needs_indexes": false,
+          "needs_triggers": true,
+          "needs_views": false,
+          "needs_routines": false,
+          "advanced_keywords": ["order create insert new"],
+          "search_breadth": "medium"
+        }}
+        
+        Example 7: Views Query
+        User: "Show me all sales summary views"
+        
+        Analysis:
+        - Explicitly asking about views
+        - Sales-related virtual tables
+        
+        Output:
+        {{
+          "table_keywords": ["sales revenue order transaction"],
+          "column_keywords": ["sales revenue total amount"],
+          "needs_relationships": false,
+          "relationship_keywords": [],
+          "needs_constraints": false,
+          "needs_indexes": false,
+          "needs_triggers": false,
+          "needs_views": true,
+          "needs_routines": false,
+          "advanced_keywords": ["sales summary report total"],
+          "search_breadth": "medium"
+        }}
+        
+        Example 8: Stored Procedures Query
+        User: "What stored procedures calculate customer loyalty points?"
+        
+        Analysis:
+        - Asking about stored procedures/functions
+        - Customer and loyalty point calculation logic
+        
+        Output:
+        {{
+          "table_keywords": ["customer client loyalty points rewards"],
+          "column_keywords": ["customerID points loyalty_points"],
+          "needs_relationships": false,
+          "relationship_keywords": [],
+          "needs_constraints": false,
+          "needs_indexes": false,
+          "needs_triggers": false,
+          "needs_views": false,
+          "needs_routines": true,
+          "advanced_keywords": ["customer loyalty points calculate reward"],
+          "search_breadth": "medium"
+        }}
+        
+        Example 9: Comprehensive Schema Exploration
+        User: "Tell me everything about the Order processing system"
+        
+        Analysis:
+        - Very exploratory
+        - Need tables, relationships, triggers, views, procedures
+        - Comprehensive retrieval
+        
+        Output:
+        {{
+          "table_keywords": [
+            "order orders purchase sale transaction",
+            "order_detail order_item line_item",
+            "customer client buyer",
+            "product item goods",
+            "payment transaction",
+            "shipping delivery"
+          ],
+          "column_keywords": [
+            "orderID order_id purchase_id",
+            "customerID customer_id",
+            "productID product_id",
+            "status order_status state",
+            "total amount price"
+          ],
+          "needs_relationships": true,
+          "relationship_keywords": [
+            "order customer",
+            "order order_detail",
+            "order_detail product",
+            "order payment",
+            "order shipping"
+          ],
+          "needs_constraints": true,
+          "needs_indexes": true,
+          "needs_triggers": true,
+          "needs_views": true,
+          "needs_routines": true,
+          "advanced_keywords": ["order process payment shipping calculate"],
+          "search_breadth": "wide"
+        }}
+        
+        === CRITICAL GUIDELINES ===
+        
+        1. **Combine keywords with spaces**: 
+           - GOOD: "customer client buyer user"
+           - BAD: ["customer", "client", "buyer", "user"]
+        
+        2. **Think about variations**:
+           - Different naming conventions: customer_id, customerID, CustomerId
+           - Synonyms: client, buyer, user, account
+           - Abbreviations: dept vs department, qty vs quantity
+        
+        3. **Be comprehensive for column_keywords**:
+           - Include ID fields
+           - Include data fields mentioned in question
+           - Include related fields that might be needed
+           - Group semantically related terms together
+        
+        4. **Set the right boolean flags**:
+           - needs_relationships: Multi-table queries, joins, "how are they connected"
+           - needs_constraints: "rules", "validation", "requirements", "constraints"
+           - needs_indexes: "performance", "optimization", "indexes", "slow queries"
+           - needs_triggers: "what happens when", "automated", "on insert/update/delete"
+           - needs_views: "views", "virtual tables", "summary tables", "reports"
+           - needs_routines: "stored procedure", "function", "logic", "calculate"
+        
+        5. **Use advanced_keywords when appropriate**:
+           - Only populate if needs_indexes, needs_triggers, needs_views, or needs_routines is true
+           - Combine relevant terms for searching these advanced objects
+        
+        6. **Choose search_breadth wisely**:
+           - narrow: You know exactly what table(s) you need, simple query
+           - medium: 2-3 tables, standard relationships, or asking about specific advanced objects
+           - wide: Complex query, multiple joins, exploratory, or comprehensive schema analysis
+        
+        7. **Output ONLY valid JSON, nothing else**
     """,
-    agent=coordinator_agent,
+    agent=schema_linking_agent,
     context=[check_task],
-    expected_output="A comprehensive JSON containing all queried collections and their retrieved metadata, organized by collection type.",
-    condition=lambda context: check_task_should_run(context)
+    expected_output="A JSON object specifying keyword-based retrieval plan with combined search terms and collection flags"
 )
 
-sql_error = None
+# -----------------------------------------
+# PYTHON FUNCTION: Execute Retrieval Plan
+# -----------------------------------------
 
-sql_task = Task(
-    description=f"""
-        Given the user question and the database schema, 
-        generate valid SQL using the retry loop defined in your agent.
-
-        generate sql for sql server engine, use top instead of limit
-
-        user question:
-        {{user_prompt}}
-
-        You will call sql_tool and recieve an output, if it an error call the tool again and try not to make the same mistake.
-
-        error from previous call:
-        {sql_error}
+def execute_retrieval_plan(schema_plan_output):
+    """
+    Parses the schema linking plan JSON and executes all RAG calls in Python.
+    Returns aggregated metadata results.
+    """
+    try:
+        # Parse the schema linking plan
+        plan = json.loads(schema_plan_output)
         
-        Metadata context: {{extractor_task.output}}
+        # Check if we should skip
+        if plan.get("skip") == True:
+            return json.dumps({"skip": True})
+        
+        # Extract plan components
+        table_keywords = plan.get("table_keywords", [])
+        column_keywords = plan.get("column_keywords", [])
+        needs_relationships = plan.get("needs_relationships", False)
+        relationship_keywords = plan.get("relationship_keywords", [])
+        needs_constraints = plan.get("needs_constraints", False)
+        needs_indexes = plan.get("needs_indexes", False)
+        needs_triggers = plan.get("needs_triggers", False)
+        needs_views = plan.get("needs_views", False)
+        needs_routines = plan.get("needs_routines", False)
+        advanced_keywords = plan.get("advanced_keywords", [])
+        search_breadth = plan.get("search_breadth", "medium")
+        
+        # Determine k values based on search_breadth
+        k_values = {
+            "narrow": {
+                "tables": 15, "columns": 25, "foreign_keys": 30,
+                "primary_keys": 20, "constraints": 25, "indexes": 20,
+                "triggers": 15, "views": 15, "routines": 15
+            },
+            "medium": {
+                "tables": 35, "columns": 50, "foreign_keys": 60,
+                "primary_keys": 40, "constraints": 45, "indexes": 40,
+                "triggers": 30, "views": 30, "routines": 30
+            },
+            "wide": {
+                "tables": 60, "columns": 80, "foreign_keys": 100,
+                "primary_keys": 70, "constraints": 70, "indexes": 60,
+                "triggers": 50, "views": 50, "routines": 50
+            }
+        }
+        
+        k = k_values.get(search_breadth, k_values["medium"])
+        
+        # Initialize results
+        results = {
+            "tables_found": [],
+            "columns_found": [],
+            "foreign_keys_found": [],
+            "primary_keys_found": [],
+            "constraints_found": [],
+            "check_constraints_found": [],
+            "indexes_found": [],
+            "triggers_found": [],
+            "views_found": [],
+            "routines_found": []
+        }
+        
+        # Execute retrieval calls
+        
+        # 1. Search for Tables (ALWAYS)
+        for keyword_phrase in table_keywords:
+            context = match_embedding(keyword_phrase, k["tables"], "tables")
+            if context:
+                results["tables_found"].append(context)
+        
+        # 2. Search for Columns (ALWAYS)
+        for keyword_phrase in column_keywords:
+            context = match_embedding(keyword_phrase, k["columns"], "columns")
+            if context:
+                results["columns_found"].append(context)
+        
+        # 3. Search for Relationships (if needed)
+        if needs_relationships:
+            for keyword_phrase in relationship_keywords:
+                fk_context = match_embedding(keyword_phrase, k["foreign_keys"], "foreign_keys")
+                pk_context = match_embedding(keyword_phrase, k["primary_keys"], "primary_keys")
+                if fk_context:
+                    results["foreign_keys_found"].append(fk_context)
+                if pk_context:
+                    results["primary_keys_found"].append(pk_context)
+        
+        # 4. Search for Constraints (if needed)
+        if needs_constraints:
+            for keyword_phrase in table_keywords:
+                const_context = match_embedding(keyword_phrase, k["constraints"], "constraints")
+                check_context = match_embedding(keyword_phrase, k["constraints"], "check_constraints")
+                if const_context:
+                    results["constraints_found"].append(const_context)
+                if check_context:
+                    results["check_constraints_found"].append(check_context)
+        
+        # 5. Search for Indexes (if needed)
+        if needs_indexes:
+            for keyword_phrase in advanced_keywords:
+                idx_context = match_embedding(keyword_phrase, k["indexes"], "indexes")
+                if idx_context:
+                    results["indexes_found"].append(idx_context)
+        
+        # 6. Search for Triggers (if needed)
+        if needs_triggers:
+            for keyword_phrase in advanced_keywords:
+                trigger_context = match_embedding(keyword_phrase, k["triggers"], "triggers")
+                if trigger_context:
+                    results["triggers_found"].append(trigger_context)
+        
+        # 7. Search for Views (if needed)
+        if needs_views:
+            for keyword_phrase in advanced_keywords:
+                view_context = match_embedding(keyword_phrase, k["views"], "views")
+                if view_context:
+                    results["views_found"].append(view_context)
+        
+        # 8. Search for Routines (if needed)
+        if needs_routines:
+            for keyword_phrase in advanced_keywords:
+                routine_context = match_embedding(keyword_phrase, k["routines"], "routines")
+                if routine_context:
+                    results["routines_found"].append(routine_context)
+        
+        # Format output
+        output = "=== RETRIEVED METADATA CONTEXT ===\n\n"
+        
+        for key, value in results.items():
+            if value:  # Only include non-empty results
+                output += f"\n### {key.replace('_', ' ').title()}:\n"
+                output += "\n".join(value)
+                output += "\n"
+        
+        return output
+        
+    except json.JSONDecodeError as e:
+        return f"Error parsing schema linking plan: {str(e)}"
+    except Exception as e:
+        return f"Error executing retrieval plan: {str(e)}"
+
+extraction_execution_task = Task(
+    description="""
+        RETRIEVED METADATA CONTEXT:
+        {extracted_metadata}
+        
+        Simply output the extracted metadata context that was provided.
+    """,
+    agent=coordinator_agent,
+    context=[check_task, schema_linking_task],
+    expected_output="Retrieved metadata context from Python-based RAG execution"
+)
+
+query_plan_task = Task(
+    description="""
+        You are a SQL Query Planner using Chain-of-Thought reasoning.
+        
+        PREVIOUS CHECK RESULT:
+        {check_task.output}
+        
+        === FIRST: CHECK IF YOU SHOULD SKIP ===
+        Parse the check_task.output JSON.
+        If is_queryable is "FALSE", output {{"skip": true, "reason": "No query needed"}} and end immediately.
+        
+        USER QUESTION:
+        {user_prompt}
+        
+        EXTRACTED SCHEMA CONTEXT:
+        {extraction_execution_task.output}
+        
+        PREVIOUS CONTEXT:
+        {total_context}
+        
+        === YOUR TASK: CREATE A STEP-BY-STEP QUERY PLAN ===
+        
+        Using Chain-of-Thought reasoning, generate a detailed execution plan that explains:
+        
+        **Step 1: Identify Main Entity**
+        - What is the primary table we need to query?
+        - What is the main information the user is asking for?
+        
+        **Step 2: Identify Required Joins**
+        - What other tables do we need?
+        - How are they connected? (foreign key relationships)
+        - What is the join path from the main table to related tables?
+        
+        **Step 3: Determine Filter Conditions**
+        - What WHERE conditions are needed?
+        - Are there any specific values to filter by?
+        - Any date ranges or status conditions?
+        
+        **Step 4: Plan Aggregations (if needed)**
+        - Do we need COUNT, SUM, AVG, MIN, MAX?
+        - What columns do we GROUP BY?
+        - Any HAVING conditions?
+        
+        **Step 5: Determine Sorting and Limiting**
+        - Should results be ordered? By which column(s)?
+        - Is there a limit on number of rows (TOP N)?
+        
+        **Step 6: Handle Special Cases**
+        - Any DISTINCT needed to remove duplicates?
+        - Any subqueries required?
+        - Any UNION/INTERSECT/EXCEPT operations?
+        
+        === CRITICAL RULES ===
+        
+        1. **DO NOT generate SQL code** - only the reasoning plan
+        2. Use the extracted schema context to identify exact table and column names
+        3. Explain WHY each step is needed based on the user's question
+        4. If information is missing, state what assumptions you're making
+        5. Output your plan as structured text, not code
+        
+        === EXAMPLE OUTPUT FORMAT ===
+        
+        Query Plan:
+        
+        Step 1: Main Entity
+        - Primary table: Customer
+        - Goal: Find customer purchase totals
+        
+        Step 2: Joins Needed
+        - Join Customer to Orders via Customer.CustomerID = Orders.CustomerID
+        - Join Orders to OrderDetails via Orders.OrderID = OrderDetails.OrderID
+        
+        Step 3: Filters
+        - WHERE Orders.OrderDate >= '2024-01-01'
+        - Only include completed orders (Status = 'Completed')
+        
+        Step 4: Aggregations
+        - SUM(OrderDetails.Quantity * OrderDetails.UnitPrice) as TotalPurchase
+        - GROUP BY Customer.CustomerID, Customer.Name
+        
+        Step 5: Sorting
+        - ORDER BY TotalPurchase DESC
+        - TOP 10 customers
+        
+        Step 6: Special Cases
+        - None needed for this query
     """,
     agent=sql_agent,
-    context=[check_task, extractor_task],
-    expected_output="Structured json with sql output or final error",
-    condition=lambda context: sql_task_should_run(context)
+    context=[check_task, schema_linking_task, extraction_execution_task],
+    expected_output="A detailed Chain-of-Thought query execution plan explaining each step (NOT SQL code)"
+)
+
+sql_task = Task(
+    description="""
+        PREVIOUS CHECK RESULT:
+        {check_task.output}
+        
+        === FIRST: CHECK IF YOU SHOULD SKIP ===
+        Parse the check_task.output JSON.
+        If is_queryable is "FALSE", output {{"skip": true, "reason": "No query needed"}} and end immediately.
+        
+        Also check query_plan_task.output - if it contains {{"skip": true}}, output {{"skip": true}} and end.
+
+        Now you have a step-by-step query plan from the Query Plan Agent.
+        Your job is to convert this plan into actual SQL code.
+
+        QUERY PLAN:
+        {query_plan_task.output}
+
+        USER QUESTION:
+        {user_prompt}
+        
+        METADATA CONTEXT:
+        {extraction_execution_task.output}
+
+        PREVIOUS QUERIES:
+        {total_context}
+
+        === YOUR TASK: GENERATE SQL ===
+        
+        Follow the query plan step-by-step to generate valid SQL Server syntax.
+        - Use TOP instead of LIMIT
+        - Use correct table and column names from metadata
+        - Follow SQL Server conventions
+        
+        === ERROR HANDLING LOOP ===
+        1. Generate SQL query
+        2. Call sql_tool(sql_query="your SQL here")
+        3. Check the result:
+           - If success == true: Output {{"success": true, "sql_query": "...", "data": [...]}}
+           - If success == false: Read the error, fix the SQL, and retry
+        4. Maximum 5 retry attempts
+        5. After 5 failures, output {{"final_error": "explanation of what went wrong"}}
+
+        ALWAYS output valid JSON with either:
+        - {{"success": true, "sql_query": "...", "data": [...]}}
+        - {{"final_error": "..."}} (after 5 failed attempts)
+        - {{"skip": true}} (if skipping)
+
+    """,
+    agent=sql_agent,
+    context=[check_task, schema_linking_task, extraction_execution_task, query_plan_task],
+    expected_output="Structured json with sql query and output or final error",
 )
 
 response_task = Task(
     description="""
         Your job is to answer the user's question using all available output:
 
-        The user question is:
-        {user_prompt}
-
-        Database summary:
+        DATABASE SUMMARY:
         {db_summary}
 
-        Use the outputs from previous tasks:
-        - Check result: {check_task.output}
-        - Extracted metadata context: {extractor_task.output}
-        - SQL query result (if exists): {sql_task.output}
+        USER QUESTION:
+        {user_prompt}
 
-        Use whatever information exists.  
-        If something is missing (null), ignore it.
+        CHAT HISTORY:
+        {chat_history}
+
+        === OUTPUTS FROM PREVIOUS TASKS ===
+        
+        Check result: {check_task.output}
+        Schema linking plan: {schema_linking_task.output}
+        Extracted metadata context: {extraction_execution_task.output}
+        Query execution plan: {query_plan_task.output}
+        SQL query result: {sql_task.output}
+        Previously collected data: {total_context}
+
+        === YOUR TASK: GENERATE FINAL RESPONSE ===
+        
+        1. Parse all the outputs above (they may contain JSON)
+        2. If any task was skipped (contains {{"skip": true}}), understand why
+        3. Use whatever information is available to answer the user
+        
+        **Response Guidelines:**
+        - If the user asked for data and SQL was executed successfully:
+          * State the SQL query used
+          * Show up to 10 sample rows (unless user asks for more)
+          * Summarize the results in natural language
+        
+        - If the user asked about schema/structure (no query needed):
+          * Use the extracted metadata context
+          * Explain relationships, tables, columns clearly
+        
+        - If there was an error:
+          * Explain what went wrong
+          * Suggest how the user can rephrase or fix their question
+        
+        - If the question is irrelevant to the database:
+          * Politely explain you can only answer database-related questions
+          * Suggest what types of questions you can help with
+        
+        **Quality Rules:**
+        - Be concise but complete
+        - Use bullet points for lists
+        - Format data in readable tables when appropriate
+        - If information is missing or null, skip it gracefully
+        - Encourage specificity if the question is too broad
     """,
     agent=response_agent,
-    context=[check_task, extractor_task, sql_task],
+    context=[check_task, schema_linking_task, extraction_execution_task, query_plan_task, sql_task],
     expected_output="Final response json"
 )
 
 
-def check_task_should_run(context):
-    """Run extractor_task only if is_true is TRUE"""
-    try:
-        check_output = None
-
-        if check_task in context:
-            check_output = context[check_task]
-
-        elif 'check_task' in context:
-            check_output = context['check_task']
-
-        elif hasattr(check_task, 'output') and check_task.output:
-            check_output = check_task.output
-        
-        if check_output is None:
-            print("[CONDITION CHECK] check_output is None, returning False")
-            return False
-        
-        if hasattr(check_output, 'raw'):
-            check_output = check_output.raw
-            
-        if isinstance(check_output, str):
-            result = json.loads(check_output)
-        else:
-            result = check_output
-            
-        is_true = result.get('is_true', 'FALSE')
-        print(f"[CONDITION CHECK] is_true = {is_true}")
-        return is_true == 'TRUE'
-    except Exception as e:
-        print(f"[CONDITION ERROR] check_task_should_run: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-
-
-def sql_task_should_run(context):
-    """Run sql_task only if is_queryable is TRUE"""
-    try:
-        check_output = None
-        
-        if check_task in context:
-            check_output = context[check_task]
-
-        elif 'check_task' in context:
-            check_output = context['check_task']
-
-        elif hasattr(check_task, 'output') and check_task.output:
-            check_output = check_task.output
-        
-        if check_output is None:
-            print("[CONDITION CHECK] check_output is None, returning False")
-            return False
-        
-        if hasattr(check_output, 'raw'):
-            check_output = check_output.raw
-            
-        if isinstance(check_output, str):
-            result = json.loads(check_output)
-        else:
-            result = check_output
-            
-        is_queryable = result.get('is_queryable', 'FALSE')
-        print(f"[CONDITION CHECK] is_queryable = {is_queryable}")
-        return is_queryable == 'TRUE'
-    except Exception as e:
-        print(f"[CONDITION ERROR] sql_task_should_run: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
 
 
 crew = Crew(
     agents=[
         coordinator_agent,
+        schema_linking_agent,
         sql_agent,
         response_agent
     ],
     tasks=[
         check_task,
-        extractor_task,
+        schema_linking_task,
+        extraction_execution_task,
+        query_plan_task,
         sql_task,
         response_task
     ],
-    verbose=True
+    verbose=True,
+    tracing=True
 )
 
+collected_context = []
 
 def chat_func(message, history):
     try:
+        # First, do a preliminary run to get schema linking output
+        # We need to execute schema_linking_task first to get the plan
+        preliminary_crew = Crew(
+            agents=[coordinator_agent, schema_linking_agent],
+            tasks=[check_task, schema_linking_task],
+            verbose=False
+        )
+        
+        preliminary_result = preliminary_crew.kickoff(inputs={
+            'user_prompt': message,
+            'db_summary': db_summary,
+            'chat_history': history,
+            'total_context': collected_context
+        })
+        
+        # Get schema linking output
+        schema_plan = schema_linking_task.output.raw if schema_linking_task.output else "{}"
+        
+        # Execute retrieval in Python
+        extraction_output = execute_retrieval_plan(schema_plan)
+        
+        # Now run the full crew with extraction results injected
         result = crew.kickoff(inputs={
             'user_prompt': message,
-            'db_summary': db_summary
+            'db_summary': db_summary,
+            'chat_history': history,
+            'total_context': collected_context,
+            'extracted_metadata': extraction_output  # Inject the Python-generated extraction results
         })
+        try:
+            # Use the Python-generated extraction output directly
+            extraction_data = str(extraction_output)
+            
+            # Get SQL output and parse JSON
+            sql_output = sql_task.output.raw if sql_task.output else "{}"
+            sql_data = json.loads(sql_output) if sql_output != "None" else {}
+            sql_query = sql_data.get("sql_query", "None")
+            
+            collected_context.append(f"""extracted data: {extraction_data}
+                                        performed queries: {sql_query}
+                                    """)
+        except Exception as e:
+            print(f"Error collecting context: {e}")
+            collected_context.append("Error collecting context")
         return result.raw
     except Exception as e:
         print(f"[CHAT ERROR] {e}")
