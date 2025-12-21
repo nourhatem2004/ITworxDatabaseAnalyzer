@@ -1,0 +1,27 @@
+{
+  "success": true,
+  "data": [
+    {
+      "Id": "1523ECCB-4130-4E3...",
+      "DisplayName": "Ibtikar"
+    },
+    {
+      "Id": "7094EFBF-05BA-4FB...",
+      "DisplayName": "My institute"
+    },
+    {
+      "Id": "36AB3299-F48D-452...",
+      "DisplayName": "My institute"
+    },
+    {
+      "Id": "C27511A9-C510-4C0...",
+      "DisplayName": "My institute"
+    },
+    {
+      "Id": "14F1EC34-0FD3-47F...",
+      "DisplayName": "My institute"
+    }
+  ],
+  "total_rows": 1553,
+  "rows_shown": 5
+}

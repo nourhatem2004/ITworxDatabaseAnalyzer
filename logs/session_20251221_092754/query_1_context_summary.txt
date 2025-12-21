@@ -1,0 +1,9 @@
+SUMMARIZED CONTEXT - 285 characters (was 52885)
+================================================================================
+
+TABLES NEEDED:
+- dbo.Organizations: Id (uniqueidentifier), DisplayName (nvarchar)
+
+KEY COLUMNS:
+- dbo.Organizations.Id: uniqueidentifier - Unique identifier for each organization.
+- dbo.Organizations.DisplayName: nvarchar - The name of the organization, directly requested by the user.

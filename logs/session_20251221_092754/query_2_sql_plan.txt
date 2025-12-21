@@ -1,0 +1,35 @@
+Here's a detailed execution plan to get the top 3 scoring students per course:
+
+**Step 1: Identify Main Entity**
+The primary entity for this query is `dbo.StudentScore`, as it contains the core information about student performance (`Mark`), and links to both courses and students. We will start by selecting `CourseId`, `StudentId`, and `Mark` from this table.
+
+**Step 2: Identify Required Joins**
+To enrich the data with meaningful names and details, the following joins are required:
+1.  **`dbo.StudentScore` (aliased as `ss`) to `dbo.Courses` (aliased as `c`)**: Join on `ss.CourseId = c.Id` to retrieve the `Course Name`.
+2.  **`dbo.StudentScore` (aliased as `ss`) to `dbo.Users` (aliased as `u`)**: Join on `ss.StudentId = u.Id` to link student scores to user accounts.
+3.  **`dbo.Users` (aliased as `u`) to `dbo.SystemUsers` (aliased as `su`)**: Join on `u.SystemUserId = su.Id` to retrieve the student's `FirstName` and `LastName`.
+
+**Step 3: Determine Filter Conditions**
+To ensure only relevant and active data is considered, the following `WHERE` conditions will be applied:
+1.  **`ss.IsDeleted = 0`**: To exclude soft-deleted student scores.
+2.  **`c.IsDeleted = 0`**: To exclude soft-deleted courses.
+3.  **`Rank <= 3`**: This filter will be applied *after* the ranking function (from Step 4) has been calculated, to select only the top 3 students within each course.
+
+**Step 4: Plan Aggregations**
+This query requires a ranking mechanism rather than traditional aggregations (like SUM, COUNT). A window function will be used:
+1.  **`ROW_NUMBER()`**: This function will assign a unique rank to each student's score within a specific course.
+2.  **`PARTITION BY ss.CourseId`**: The ranking will be reset for each distinct `CourseId`, ensuring that ranks are calculated independently for every course.
+3.  **`ORDER BY ss.Mark DESC`**: Within each course partition, students will be ordered by their `Mark` in descending order, so the highest score gets rank 1, the second highest rank 2, and so on.
+This calculated rank will be aliased (e.g., `StudentRank`).
+
+**Step 5: Determine Sorting and Limiting**
+1.  **Intermediate Step (after ranking and filtering):** The results will be filtered to include only those records where `StudentRank <= 3`.
+2.  **Final Output Ordering**: For readability and logical presentation, the final result set should be ordered:
+    *   First, by `Course Name` in ascending order.
+    *   Then, by `StudentRank` in ascending order (or `Mark` in descending order) to show the top students first within each course.
+
+**Step 6: Handle Special Cases**
+The primary special case is the use of a window function for ranking, which necessitates a multi-stage query structure:
+1.  **Common Table Expression (CTE) or Subquery**: All the joins and the `ROW_NUMBER()` calculation (from Steps 1, 2, and 4) will be performed within a CTE or an inline subquery. This intermediate result set will include all the necessary columns (`Course Name`, `Student First Name`, `Student Last Name`, `Mark`, and `StudentRank`).
+2.  **Outer Query**: An outer query will then select the desired columns from this CTE/subquery and apply the final filter (`StudentRank <= 3`) and the final `ORDER BY` clause (from Step 5).
+No `DISTINCT` is explicitly needed as `ROW_NUMBER()` ensures unique ranks within partitions, and we are interested in individual student scores. No `UNION` or other complex set operations are required.

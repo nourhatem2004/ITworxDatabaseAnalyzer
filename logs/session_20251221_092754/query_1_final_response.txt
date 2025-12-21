@@ -1,0 +1,17 @@
+```sql
+SELECT
+  Id,
+  DisplayName
+FROM dbo.Organizations;
+```
+
+Sample Rows:
+| Id | DisplayName |
+|:---|:------------|
+| 1523ECCB-4130-4E3... | Ibtikar |
+| 7094EFBF-05BA-4FB... | My institute |
+| 36AB3299-F48D-452... | My institute |
+| C27511A9-C510-4C0... | My institute |
+| 14F1EC34-0FD3-47F... | My institute |
+
+The query successfully retrieved a list of all organizations, including their unique identifiers and display names. A total of 1553 organizations were found.

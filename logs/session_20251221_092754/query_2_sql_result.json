@@ -1,0 +1,37 @@
+{
+  "success": true,
+  "data": [
+    {
+      "CourseName": "123",
+      "StudentFirstName": "Rana",
+      "StudentLastName": "Ahmed",
+      "Mark": 50.0
+    },
+    {
+      "CourseName": "123",
+      "StudentFirstName": "Koky",
+      "StudentLastName": "Aly",
+      "Mark": 50.0
+    },
+    {
+      "CourseName": "123",
+      "StudentFirstName": "Koky",
+      "StudentLastName": "Aly",
+      "Mark": 50.0
+    },
+    {
+      "CourseName": "123456789",
+      "StudentFirstName": "aaaaaaaaaaaa",
+      "StudentLastName": "aaaaaa",
+      "Mark": 50.0
+    },
+    {
+      "CourseName": "123456789",
+      "StudentFirstName": "ApIs",
+      "StudentLastName": "radwa",
+      "Mark": 25.0
+    }
+  ],
+  "total_rows": 557,
+  "rows_shown": 5
+}

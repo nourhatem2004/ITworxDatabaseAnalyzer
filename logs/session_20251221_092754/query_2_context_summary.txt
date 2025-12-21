@@ -1,0 +1,30 @@
+SUMMARIZED CONTEXT - 1592 characters (was 186992)
+================================================================================
+
+TABLES NEEDED:
+- `dbo.StudentScore`: `CourseId` (int), `StudentId` (int), `Mark` (float), `IsDeleted` (bit)
+- `dbo.Courses`: `Id` (int), `Name` (nvarchar)
+- `dbo.Users`: `Id` (int), `SystemUserId` (int)
+- `dbo.SystemUsers`: `Id` (int), `FirstName` (nvarchar), `LastName` (nvarchar)
+
+JOIN PATHS:
+- `dbo.StudentScore` (ss) -> `dbo.Courses` (c) via `ss.CourseId = c.Id`
+- `dbo.StudentScore` (ss) -> `dbo.Users` (u) via `ss.StudentId = u.Id`
+- `dbo.Users` (u) -> `dbo.SystemUsers` (su) via `u.SystemUserId = su.Id`
+
+KEY COLUMNS:
+- `ss.CourseId`: int - Used to link scores to courses and for partitioning in ranking.
+- `ss.StudentId`: int - Used to link scores to students and identify individual students.
+- `ss.Mark`: float - The score value used for ranking students.
+- `ss.IsDeleted`: bit - Used to filter out soft-deleted scores.
+- `c.Id`: int - Primary key for `dbo.Courses`, used in join.
+- `c.Name`: nvarchar - The name of the course to be displayed.
+- `u.Id`: int - Primary key for `dbo.Users`, used in join.
+- `u.SystemUserId`: int - Foreign key to `dbo.SystemUsers` to get student's personal details.
+- `su.Id`: int - Primary key for `dbo.SystemUsers`, used in join.
+- `su.FirstName`: nvarchar - Student's first name.
+- `su.LastName`: nvarchar - Student's last name.
+
+CONSTRAINTS/NOTES:
+- Only active scores (`dbo.StudentScore.IsDeleted = 0`) and active courses (`dbo.Courses.IsDeleted = 0`) should be considered.
+- The query will require a window function (e.g., `ROW_NUMBER()`) partitioned by `CourseId` and ordered by `Mark` in descending order to find the top 3 students per course.

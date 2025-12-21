@@ -1,6 +1,7 @@
 import os, warnings
 import pyodbc
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -325,8 +326,18 @@ metadata["routines"] = query("""
 
 
 print("creating embeddings")
-for section_name in metadata:
-    create_embeddings(section_name)
+
+# Run embedding creation in parallel using ThreadPoolExecutor
+with ThreadPoolExecutor(max_workers=len(metadata)) as executor:
+    futures = {executor.submit(create_embeddings, section_name): section_name for section_name in metadata}
+    for future in as_completed(futures):
+        section = futures[future]
+        try:
+            future.result()
+            print(f"  - {section} embeddings created")
+        except Exception as e:
+            print(f"  - {section} failed: {e}")
+
 print("done")
 
 
@@ -340,36 +351,188 @@ print("done")
 # -----------------------------------------
 
 @tool
-def context_extractor(prompt: str, collection_name: str,k: int):
-    """Returns the most relevant context based on semantic similarity search."""
-    context = match_embedding(prompt,k,collection_name)
-
-    return context
+def execute_retrieval_plan(schema_plan_json: str) -> str:
+    """
+    Executes the schema linking plan by running RAG queries against the metadata collections.
+    
+    Args:
+        schema_plan_json: A JSON string containing the schema linking plan with fields like 
+                          table_keywords, column_keywords, needs_relationships, etc.
+    
+    Returns:
+        A string containing the retrieved metadata context from all RAG queries.
+    """
+    try:
+        # Parse the schema linking plan
+        plan = json.loads(schema_plan_json)
+        
+        # Check if we should skip
+        if plan.get("skip") == True:
+            output = json.dumps({"skip": True})
+            return output
+        
+        # Extract plan components
+        table_keywords = plan.get("table_keywords", [])
+        column_keywords = plan.get("column_keywords", [])
+        needs_relationships = plan.get("needs_relationships", False)
+        relationship_keywords = plan.get("relationship_keywords", [])
+        needs_constraints = plan.get("needs_constraints", False)
+        needs_indexes = plan.get("needs_indexes", False)
+        needs_triggers = plan.get("needs_triggers", False)
+        needs_views = plan.get("needs_views", False)
+        needs_routines = plan.get("needs_routines", False)
+        advanced_keywords = plan.get("advanced_keywords", [])
+        search_breadth = plan.get("search_breadth", "medium")
+        
+        # Determine k values based on search_breadth
+        k_values = {
+            "narrow": {
+                "tables": 15, "columns": 25, "foreign_keys": 30,
+                "primary_keys": 20, "constraints": 25, "indexes": 20,
+                "triggers": 15, "views": 15, "routines": 15
+            },
+            "medium": {
+                "tables": 35, "columns": 50, "foreign_keys": 60,
+                "primary_keys": 40, "constraints": 45, "indexes": 40,
+                "triggers": 30, "views": 30, "routines": 30
+            },
+            "wide": {
+                "tables": 60, "columns": 80, "foreign_keys": 100,
+                "primary_keys": 70, "constraints": 70, "indexes": 60,
+                "triggers": 50, "views": 50, "routines": 50
+            }
+        }
+        
+        k = k_values.get(search_breadth, k_values["medium"])
+        
+        # Initialize results
+        results = {
+            "tables_found": [],
+            "columns_found": [],
+            "foreign_keys_found": [],
+            "primary_keys_found": [],
+            "constraints_found": [],
+            "check_constraints_found": [],
+            "indexes_found": [],
+            "triggers_found": [],
+            "views_found": [],
+            "routines_found": []
+        }
+        
+        # Execute retrieval calls
+        
+        # 1. Search for Tables (ALWAYS)
+        for keyword_phrase in table_keywords:
+            context = match_embedding(keyword_phrase, k["tables"], "tables")
+            if context:
+                results["tables_found"].append(context)
+        
+        # 2. Search for Columns (ALWAYS)
+        for keyword_phrase in column_keywords:
+            context = match_embedding(keyword_phrase, k["columns"], "columns")
+            if context:
+                results["columns_found"].append(context)
+        
+        # 3. Search for Relationships (if needed)
+        if needs_relationships:
+            for keyword_phrase in relationship_keywords:
+                fk_context = match_embedding(keyword_phrase, k["foreign_keys"], "foreign_keys")
+                pk_context = match_embedding(keyword_phrase, k["primary_keys"], "primary_keys")
+                if fk_context:
+                    results["foreign_keys_found"].append(fk_context)
+                if pk_context:
+                    results["primary_keys_found"].append(pk_context)
+        
+        # 4. Search for Constraints (if needed)
+        if needs_constraints:
+            for keyword_phrase in table_keywords:
+                const_context = match_embedding(keyword_phrase, k["constraints"], "constraints")
+                check_context = match_embedding(keyword_phrase, k["constraints"], "check_constraints")
+                if const_context:
+                    results["constraints_found"].append(const_context)
+                if check_context:
+                    results["check_constraints_found"].append(check_context)
+        
+        # 5. Search for Indexes (if needed)
+        if needs_indexes:
+            for keyword_phrase in advanced_keywords:
+                idx_context = match_embedding(keyword_phrase, k["indexes"], "indexes")
+                if idx_context:
+                    results["indexes_found"].append(idx_context)
+        
+        # 6. Search for Triggers (if needed)
+        if needs_triggers:
+            for keyword_phrase in advanced_keywords:
+                trigger_context = match_embedding(keyword_phrase, k["triggers"], "triggers")
+                if trigger_context:
+                    results["triggers_found"].append(trigger_context)
+        
+        # 7. Search for Views (if needed)
+        if needs_views:
+            for keyword_phrase in advanced_keywords:
+                view_context = match_embedding(keyword_phrase, k["views"], "views")
+                if view_context:
+                    results["views_found"].append(view_context)
+        
+        # 8. Search for Routines (if needed)
+        if needs_routines:
+            for keyword_phrase in advanced_keywords:
+                routine_context = match_embedding(keyword_phrase, k["routines"], "routines")
+                if routine_context:
+                    results["routines_found"].append(routine_context)
+        
+        # Format output
+        output = "=== RETRIEVED METADATA CONTEXT ===\n\n"
+        
+        for key, value in results.items():
+            if value:  # Only include non-empty results
+                output += f"\n### {key.replace('_', ' ').title()}:\n"
+                output += "\n".join(value)
+                output += "\n"
+        
+        # Store in global variable for access by other tasks
+        return output
+        
+    except json.JSONDecodeError as e:
+        error_msg = f"Error parsing schema linking plan: {str(e)}"
+        return error_msg
+    except Exception as e:
+        error_msg = f"Error executing retrieval plan: {str(e)}"
+        return error_msg
 
 @tool
 def sql_tool(sql_query: str):
     """Executes or validates an SQL query against the database."""
     output = query(sql_query)
 
-    if "SQL error Encountered" in output:
+    if isinstance(output, str) and "SQL error Encountered" in output:
         data = {
            "success" : False,
-           "error":output 
+           "error": output 
         }
-        sql_error=None
         return data
     else:
+        # Limit to first 5 rows
+        limited_output = output[:5] if isinstance(output, list) else output
+        
+        # Truncate column values that exceed 20 characters
+        truncated_output = []
+        for row in limited_output:
+            truncated_row = {}
+            for key, value in row.items():
+                if isinstance(value, str) and len(value) > 20:
+                    truncated_row[key] = value[:17] + "..."
+                else:
+                    truncated_row[key] = value
+            truncated_output.append(truncated_row)
+        
         data = {
            "success" : True,
-           "data":output 
+           "data": truncated_output,
+           "total_rows": len(output) if isinstance(output, list) else 0,
+           "rows_shown": len(truncated_output)
         }
-        sql_error=data
         return data
-
-
-
-
-
 
 
 
@@ -392,7 +555,6 @@ coordinator_agent = Agent(
     3. If user requests data → route to SQL Agent.
     4. If user requests structure or explanation → route to Response Agent.
     """,
-    tools=[context_extractor],
     llm=llm
 )
 
@@ -404,8 +566,11 @@ schema_linking_agent = Agent(
         "You output structured decisions, not raw data."
     ),
     role="Identify relevant schema elements",
-    goal="Analyze the user question and output a structured list of schema elements to retrieve",
-    tools=[],
+    goal="""Analyze the user question and create a JSON retrieval plan. 
+    CRITICAL: After creating your JSON plan, you MUST call the execute_retrieval_plan tool with your plan.
+    Your final output MUST be the result returned by the execute_retrieval_plan tool, NOT your JSON plan.
+    The tool will execute RAG queries and return the actual metadata context needed for the next tasks.""",
+    tools=[execute_retrieval_plan],
     llm=llm
 )
 
@@ -451,17 +616,6 @@ response_agent = Agent(
     tools=[],
     llm=llm
 )
-
-
-
-    
-
-# -----------------------------------------
-# CrewAI: TASKS
-# -----------------------------------------
-
-
-
 
 
 
@@ -538,6 +692,10 @@ check_task = Task(
     expected_output="A JSON object with fields: { 'is_true': 'TRUE' or 'FALSE', 'is_queryable': 'TRUE' or 'FALSE', 'needs_rag': 'TRUE' or 'FALSE' }"
 )
 
+
+# -----------------------------------------
+# PYTHON FUNCTION: Execute Retrieval Plan (Callback)
+# -----------------------------------------
 
 schema_linking_task = Task(
     description="""
@@ -948,166 +1106,13 @@ schema_linking_task = Task(
            - medium: 2-3 tables, standard relationships, or asking about specific advanced objects
            - wide: Complex query, multiple joins, exploratory, or comprehensive schema analysis
         
-        7. **Output ONLY valid JSON, nothing else**
+        7. **After creating your JSON plan, IMMEDIATELY call the execute_retrieval_plan tool with your **STRINGIFIED** JSON plan**
+        8. **Your final output MUST be the result returned by execute_retrieval_plan tool**
+        9. **Do NOT output your JSON plan as the final answer - the tool's output is your final answer**
     """,
     agent=schema_linking_agent,
     context=[check_task],
-    expected_output="A JSON object specifying keyword-based retrieval plan with combined search terms and collection flags"
-)
-
-# -----------------------------------------
-# PYTHON FUNCTION: Execute Retrieval Plan
-# -----------------------------------------
-
-def execute_retrieval_plan(schema_plan_output):
-    """
-    Parses the schema linking plan JSON and executes all RAG calls in Python.
-    Returns aggregated metadata results.
-    """
-    try:
-        # Parse the schema linking plan
-        plan = json.loads(schema_plan_output)
-        
-        # Check if we should skip
-        if plan.get("skip") == True:
-            return json.dumps({"skip": True})
-        
-        # Extract plan components
-        table_keywords = plan.get("table_keywords", [])
-        column_keywords = plan.get("column_keywords", [])
-        needs_relationships = plan.get("needs_relationships", False)
-        relationship_keywords = plan.get("relationship_keywords", [])
-        needs_constraints = plan.get("needs_constraints", False)
-        needs_indexes = plan.get("needs_indexes", False)
-        needs_triggers = plan.get("needs_triggers", False)
-        needs_views = plan.get("needs_views", False)
-        needs_routines = plan.get("needs_routines", False)
-        advanced_keywords = plan.get("advanced_keywords", [])
-        search_breadth = plan.get("search_breadth", "medium")
-        
-        # Determine k values based on search_breadth
-        k_values = {
-            "narrow": {
-                "tables": 15, "columns": 25, "foreign_keys": 30,
-                "primary_keys": 20, "constraints": 25, "indexes": 20,
-                "triggers": 15, "views": 15, "routines": 15
-            },
-            "medium": {
-                "tables": 35, "columns": 50, "foreign_keys": 60,
-                "primary_keys": 40, "constraints": 45, "indexes": 40,
-                "triggers": 30, "views": 30, "routines": 30
-            },
-            "wide": {
-                "tables": 60, "columns": 80, "foreign_keys": 100,
-                "primary_keys": 70, "constraints": 70, "indexes": 60,
-                "triggers": 50, "views": 50, "routines": 50
-            }
-        }
-        
-        k = k_values.get(search_breadth, k_values["medium"])
-        
-        # Initialize results
-        results = {
-            "tables_found": [],
-            "columns_found": [],
-            "foreign_keys_found": [],
-            "primary_keys_found": [],
-            "constraints_found": [],
-            "check_constraints_found": [],
-            "indexes_found": [],
-            "triggers_found": [],
-            "views_found": [],
-            "routines_found": []
-        }
-        
-        # Execute retrieval calls
-        
-        # 1. Search for Tables (ALWAYS)
-        for keyword_phrase in table_keywords:
-            context = match_embedding(keyword_phrase, k["tables"], "tables")
-            if context:
-                results["tables_found"].append(context)
-        
-        # 2. Search for Columns (ALWAYS)
-        for keyword_phrase in column_keywords:
-            context = match_embedding(keyword_phrase, k["columns"], "columns")
-            if context:
-                results["columns_found"].append(context)
-        
-        # 3. Search for Relationships (if needed)
-        if needs_relationships:
-            for keyword_phrase in relationship_keywords:
-                fk_context = match_embedding(keyword_phrase, k["foreign_keys"], "foreign_keys")
-                pk_context = match_embedding(keyword_phrase, k["primary_keys"], "primary_keys")
-                if fk_context:
-                    results["foreign_keys_found"].append(fk_context)
-                if pk_context:
-                    results["primary_keys_found"].append(pk_context)
-        
-        # 4. Search for Constraints (if needed)
-        if needs_constraints:
-            for keyword_phrase in table_keywords:
-                const_context = match_embedding(keyword_phrase, k["constraints"], "constraints")
-                check_context = match_embedding(keyword_phrase, k["constraints"], "check_constraints")
-                if const_context:
-                    results["constraints_found"].append(const_context)
-                if check_context:
-                    results["check_constraints_found"].append(check_context)
-        
-        # 5. Search for Indexes (if needed)
-        if needs_indexes:
-            for keyword_phrase in advanced_keywords:
-                idx_context = match_embedding(keyword_phrase, k["indexes"], "indexes")
-                if idx_context:
-                    results["indexes_found"].append(idx_context)
-        
-        # 6. Search for Triggers (if needed)
-        if needs_triggers:
-            for keyword_phrase in advanced_keywords:
-                trigger_context = match_embedding(keyword_phrase, k["triggers"], "triggers")
-                if trigger_context:
-                    results["triggers_found"].append(trigger_context)
-        
-        # 7. Search for Views (if needed)
-        if needs_views:
-            for keyword_phrase in advanced_keywords:
-                view_context = match_embedding(keyword_phrase, k["views"], "views")
-                if view_context:
-                    results["views_found"].append(view_context)
-        
-        # 8. Search for Routines (if needed)
-        if needs_routines:
-            for keyword_phrase in advanced_keywords:
-                routine_context = match_embedding(keyword_phrase, k["routines"], "routines")
-                if routine_context:
-                    results["routines_found"].append(routine_context)
-        
-        # Format output
-        output = "=== RETRIEVED METADATA CONTEXT ===\n\n"
-        
-        for key, value in results.items():
-            if value:  # Only include non-empty results
-                output += f"\n### {key.replace('_', ' ').title()}:\n"
-                output += "\n".join(value)
-                output += "\n"
-        
-        return output
-        
-    except json.JSONDecodeError as e:
-        return f"Error parsing schema linking plan: {str(e)}"
-    except Exception as e:
-        return f"Error executing retrieval plan: {str(e)}"
-
-extraction_execution_task = Task(
-    description="""
-        RETRIEVED METADATA CONTEXT:
-        {extracted_metadata}
-        
-        Simply output the extracted metadata context that was provided.
-    """,
-    agent=coordinator_agent,
-    context=[check_task, schema_linking_task],
-    expected_output="Retrieved metadata context from Python-based RAG execution"
+    expected_output="The metadata context returned by the execute_retrieval_plan tool after executing RAG queries based on the schema linking plan"
 )
 
 query_plan_task = Task(
@@ -1124,8 +1129,8 @@ query_plan_task = Task(
         USER QUESTION:
         {user_prompt}
         
-        EXTRACTED SCHEMA CONTEXT:
-        {extraction_execution_task.output}
+        EXTRACTED SCHEMA CONTEXT (processed by RAG retrieval):
+        {schema_linking_task.output}
         
         PREVIOUS CONTEXT:
         {total_context}
@@ -1198,7 +1203,7 @@ query_plan_task = Task(
         - None needed for this query
     """,
     agent=sql_agent,
-    context=[check_task, schema_linking_task, extraction_execution_task],
+    context=[check_task, schema_linking_task],
     expected_output="A detailed Chain-of-Thought query execution plan explaining each step (NOT SQL code)"
 )
 
@@ -1222,8 +1227,8 @@ sql_task = Task(
         USER QUESTION:
         {user_prompt}
         
-        METADATA CONTEXT:
-        {extraction_execution_task.output}
+        METADATA CONTEXT (processed by RAG retrieval):
+        {schema_linking_task.output}
 
         PREVIOUS QUERIES:
         {total_context}
@@ -1251,7 +1256,7 @@ sql_task = Task(
 
     """,
     agent=sql_agent,
-    context=[check_task, schema_linking_task, extraction_execution_task, query_plan_task],
+    context=[check_task, schema_linking_task, query_plan_task],
     expected_output="Structured json with sql query and output or final error",
 )
 
@@ -1271,8 +1276,7 @@ response_task = Task(
         === OUTPUTS FROM PREVIOUS TASKS ===
         
         Check result: {check_task.output}
-        Schema linking plan: {schema_linking_task.output}
-        Extracted metadata context: {extraction_execution_task.output}
+        Schema linking plan and extracted metadata: {schema_linking_task.output}
         Query execution plan: {query_plan_task.output}
         SQL query result: {sql_task.output}
         Previously collected data: {total_context}
@@ -1307,10 +1311,23 @@ response_task = Task(
         - Format data in readable tables when appropriate
         - If information is missing or null, skip it gracefully
         - Encourage specificity if the question is too broad
+
+        ***CRITICAL FORMATTING RULES***:
+        - DO NOT include any reasoning, analysis, or thought process
+        - DO NOT start with "Based on the outputs..." or "Let me analyze..."
+        - DO NOT explain how you arrived at the answer
+        - DO NOT include phrases like "I see that...", "Looking at...", "According to..."
+        - ONLY output the direct answer the user would expect to see
+        - Start immediately with the relevant information (data, explanation, or error message)
+        
+        Example of WRONG output:
+        "The user is asking for .... , Based on the SQL query results, I can see that there are 5 customers. The query executed successfully..."
+        
+
     """,
     agent=response_agent,
-    context=[check_task, schema_linking_task, extraction_execution_task, query_plan_task, sql_task],
-    expected_output="Final response json"
+    context=[check_task, schema_linking_task, query_plan_task, sql_task],
+    expected_output="A direct, user-friendly response with NO reasoning or thought process. Just the answer: data tables, explanations of schema, or error messages. Never include analysis steps."
 )
 
 
@@ -1326,7 +1343,6 @@ crew = Crew(
     tasks=[
         check_task,
         schema_linking_task,
-        extraction_execution_task,
         query_plan_task,
         sql_task,
         response_task
@@ -1339,45 +1355,20 @@ collected_context = []
 
 def chat_func(message, history):
     try:
-        # First, do a preliminary run to get schema linking output
-        # We need to execute schema_linking_task first to get the plan
-        preliminary_crew = Crew(
-            agents=[coordinator_agent, schema_linking_agent],
-            tasks=[check_task, schema_linking_task],
-            verbose=False
-        )
-        
-        preliminary_result = preliminary_crew.kickoff(inputs={
+        result = crew.kickoff(inputs={
             'user_prompt': message,
             'db_summary': db_summary,
             'chat_history': history,
             'total_context': collected_context
         })
         
-        # Get schema linking output
-        schema_plan = schema_linking_task.output.raw if schema_linking_task.output else "{}"
-        
-        # Execute retrieval in Python
-        extraction_output = execute_retrieval_plan(schema_plan)
-        
-        # Now run the full crew with extraction results injected
-        result = crew.kickoff(inputs={
-            'user_prompt': message,
-            'db_summary': db_summary,
-            'chat_history': history,
-            'total_context': collected_context,
-            'extracted_metadata': extraction_output  # Inject the Python-generated extraction results
-        })
         try:
-            # Use the Python-generated extraction output directly
-            extraction_data = str(extraction_output)
-            
-            # Get SQL output and parse JSON
+
             sql_output = sql_task.output.raw if sql_task.output else "{}"
             sql_data = json.loads(sql_output) if sql_output != "None" else {}
             sql_query = sql_data.get("sql_query", "None")
             
-            collected_context.append(f"""extracted data: {extraction_data}
+            collected_context.append(f"""extracted data: {schema_linking_task.output.raw}
                                         performed queries: {sql_query}
                                     """)
         except Exception as e:
@@ -1395,5 +1386,3 @@ gr.ChatInterface(
     fn=chat_func, 
     type="messages"
 ).launch(share=True)
-
-# what is the relation between purchaseorderdetail and purchase order header
