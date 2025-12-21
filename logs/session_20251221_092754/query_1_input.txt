@@ -1,5 +1,0 @@
-USER MESSAGE:
-write a query to get the list of organizations
-
-CHAT HISTORY:
-[]
